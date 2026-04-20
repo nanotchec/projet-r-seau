@@ -1,7 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "protocol.h"
-#include "protocol_io.h"
 
 #include <errno.h>
 #include <limits.h>
@@ -23,9 +22,7 @@ struct incoming_transfer {
     uint32_t transfer_id;
     char source[ANNEAU_MAX_NODE_ID];
     char filename[ANNEAU_MAX_FILENAME];
-    uint64_t expected_size;
     uint64_t received_size;
-    uint32_t expected_chunks;
     uint32_t next_chunk;
     FILE *file;
     char output_path[PATH_MAX];
@@ -36,7 +33,7 @@ struct comm_state {
     char socket_path[PATH_MAX];
     uint32_t next_request_id;
     uint32_t next_transfer_id;
-    struct incoming_transfer incoming[ANNEAU_MAX_INCOMING_TRANSFERS];
+    struct incoming_transfer incoming;
 };
 
 static void print_help(void)
@@ -161,7 +158,6 @@ static int send_text(struct comm_state *state, const char *destination, const ch
 {
     struct anneau_text_request header;
     size_t text_len = strlen(text);
-    size_t payload_len = sizeof(header) + text_len;
     uint8_t *payload = NULL;
     int rc = -1;
 
@@ -170,7 +166,7 @@ static int send_text(struct comm_state *state, const char *destination, const ch
         return -1;
     }
 
-    payload = malloc(payload_len);
+    payload = malloc(sizeof(header) + text_len);
     if (payload == NULL) {
         perror("malloc");
         return -1;
@@ -184,7 +180,7 @@ static int send_text(struct comm_state *state, const char *destination, const ch
     memcpy(payload + sizeof(header), text, text_len);
 
     rc = anneau_send_frame(state->socket_fd, ANNEAU_MSG_SEND_TEXT_REQ, next_request_id(state),
-                           payload, (uint32_t)payload_len);
+                           payload, (uint32_t)(sizeof(header) + text_len));
     free(payload);
     return rc;
 }
@@ -193,7 +189,6 @@ static int send_broadcast(struct comm_state *state, const char *text)
 {
     struct anneau_broadcast_request header;
     size_t text_len = strlen(text);
-    size_t payload_len = sizeof(header) + text_len;
     uint8_t *payload = NULL;
     int rc = -1;
 
@@ -202,7 +197,7 @@ static int send_broadcast(struct comm_state *state, const char *text)
         return -1;
     }
 
-    payload = malloc(payload_len);
+    payload = malloc(sizeof(header) + text_len);
     if (payload == NULL) {
         perror("malloc");
         return -1;
@@ -215,7 +210,7 @@ static int send_broadcast(struct comm_state *state, const char *text)
     memcpy(payload + sizeof(header), text, text_len);
 
     rc = anneau_send_frame(state->socket_fd, ANNEAU_MSG_BROADCAST_REQ, next_request_id(state),
-                           payload, (uint32_t)payload_len);
+                           payload, (uint32_t)(sizeof(header) + text_len));
     free(payload);
     return rc;
 }
@@ -324,29 +319,23 @@ static void close_transfer(struct incoming_transfer *transfer)
     memset(transfer, 0, sizeof(*transfer));
 }
 
-static struct incoming_transfer *find_transfer(struct comm_state *state, uint32_t transfer_id)
-{
-    size_t i = 0;
-
-    for (i = 0; i < ANNEAU_MAX_INCOMING_TRANSFERS; ++i) {
-        if (state->incoming[i].active && state->incoming[i].transfer_id == transfer_id) {
-            return &state->incoming[i];
-        }
-    }
-    return NULL;
-}
-
 static struct incoming_transfer *reserve_transfer(struct comm_state *state, uint32_t transfer_id)
 {
-    size_t i = 0;
-
-    for (i = 0; i < ANNEAU_MAX_INCOMING_TRANSFERS; ++i) {
-        if (!state->incoming[i].active) {
-            state->incoming[i].active = true;
-            state->incoming[i].transfer_id = transfer_id;
-            return &state->incoming[i];
-        }
+    if (state->incoming.active) {
+        return NULL;
     }
+
+    state->incoming.active = true;
+    state->incoming.transfer_id = transfer_id;
+    return &state->incoming;
+}
+
+static struct incoming_transfer *find_transfer(struct comm_state *state, uint32_t transfer_id)
+{
+    if (state->incoming.active && state->incoming.transfer_id == transfer_id) {
+        return &state->incoming;
+    }
+
     return NULL;
 }
 
@@ -451,14 +440,12 @@ static void handle_file_start_event(struct comm_state *state, const struct annea
     ensure_download_dir();
     transfer = reserve_transfer(state, start->transfer_id);
     if (transfer == NULL) {
-        fprintf(stderr, "Trop de transferts entrants simultanés.\n");
+        fprintf(stderr, "Un seul transfert entrant a la fois est supporte.\n");
         return;
     }
 
     anneau_copy_field(transfer->source, sizeof(transfer->source), start->peer_id);
     anneau_copy_field(transfer->filename, sizeof(transfer->filename), start->filename);
-    transfer->expected_size = start->file_size;
-    transfer->expected_chunks = start->total_chunks;
     build_output_path(transfer->output_path, sizeof(transfer->output_path),
                       transfer->source, transfer->filename);
 

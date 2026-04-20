@@ -1,7 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "protocol.h"
-#include "protocol_io.h"
 
 #include <errno.h>
 #include <limits.h>

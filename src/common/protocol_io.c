@@ -1,4 +1,4 @@
-#include "protocol_io.h"
+#include "protocol.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -31,17 +31,6 @@ void anneau_copy_field(char *dst, size_t dst_size, const char *src)
         dst[i] = src[i];
     }
     dst[i] = '\0';
-}
-
-size_t anneau_field_len(const char *field, size_t field_size)
-{
-    size_t i = 0;
-
-    while (i < field_size && field[i] != '\0') {
-        ++i;
-    }
-
-    return i;
 }
 
 int anneau_read_full(int fd, void *buffer, size_t size)

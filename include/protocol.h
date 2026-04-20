@@ -14,7 +14,6 @@
 #define ANNEAU_MAX_STATUS_TEXT 128u
 #define ANNEAU_MAX_FILE_CHUNK 4096u
 #define ANNEAU_MAX_TOPOLOGY_ENTRIES 32u
-#define ANNEAU_MAX_INCOMING_TRANSFERS 8u
 
 enum anneau_message_type {
     ANNEAU_MSG_HELLO = 1,
@@ -135,6 +134,11 @@ struct anneau_frame {
 };
 
 void anneau_copy_field(char *dst, size_t dst_size, const char *src);
-size_t anneau_field_len(const char *field, size_t field_size);
+int anneau_read_full(int fd, void *buffer, size_t size);
+int anneau_write_full(int fd, const void *buffer, size_t size);
+int anneau_send_frame(int fd, uint16_t type, uint32_t request_id,
+                      const void *payload, uint32_t payload_len);
+int anneau_recv_frame(int fd, struct anneau_frame *frame);
+void anneau_free_frame(struct anneau_frame *frame);
 
 #endif
