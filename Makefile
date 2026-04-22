@@ -12,16 +12,23 @@ COMMON_OBJS := $(COMMON_SRCS:src/%.c=$(OBJ_DIR)/%.o)
 COMM_SRCS := src/comm/main.c
 COMM_OBJS := $(COMM_SRCS:src/%.c=$(OBJ_DIR)/%.o)
 
+DRIVER_SRCS := src/driver/main.c
+DRIVER_OBJS := $(DRIVER_SRCS:src/%.c=$(OBJ_DIR)/%.o)
+
 MOCK_SRCS := src/tools/mock_driver.c
 MOCK_OBJS := $(MOCK_SRCS:src/%.c=$(OBJ_DIR)/%.o)
 
-ALL_BINS := $(BIN_DIR)/comm $(BIN_DIR)/mock_driver
+ALL_BINS := $(BIN_DIR)/comm $(BIN_DIR)/driver $(BIN_DIR)/mock_driver
 
 .PHONY: all clean
 
 all: $(ALL_BINS)
 
 $(BIN_DIR)/comm: $(COMMON_OBJS) $(COMM_OBJS)
+	mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
+
+$(BIN_DIR)/driver: $(COMMON_OBJS) $(DRIVER_OBJS)
 	mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $^ -o $@ $(LDFLAGS)
 
