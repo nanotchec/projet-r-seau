@@ -517,6 +517,21 @@ static void handle_file_end_event(struct comm_state *state, const struct anneau_
         transfer->file = NULL;
     }
 
+    if (transfer->received_size != end->file_size ||
+        transfer->next_chunk != end->total_chunks ||
+        end->status != 0) {
+        fprintf(stderr,
+                "[fichier] transfert %u incomplet ou en erreur (recu=%llu/%llu, blocs=%u/%u, status=%d).\n",
+                end->transfer_id,
+                (unsigned long long)transfer->received_size,
+                (unsigned long long)end->file_size,
+                transfer->next_chunk,
+                end->total_chunks,
+                end->status);
+        close_transfer(transfer);
+        return;
+    }
+
     printf("[fichier] transfert %u terminé, %llu octets reçus dans %s\n",
            end->transfer_id,
            (unsigned long long)transfer->received_size,

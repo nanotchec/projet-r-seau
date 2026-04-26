@@ -50,6 +50,12 @@ struct driver_state {
     int q_head;                              // Indice de lecture de la file
     int q_tail;                              // Indice d'écriture de la file
     int q_size;                            // Nombre d'éléments actuellement dans la file
+
+    // Suivi minimal d'un transfert entrant pour router les chunks au bon Comm
+    bool file_receive_active;
+    uint32_t file_receive_id;
+    bool ignore_next_left_disconnect;
+    bool should_exit;
 };
 
 /* Initialise la structure du driver à zéro */
@@ -61,6 +67,36 @@ static void initialiser_etat(struct driver_state *state) {
     state->anneausockg = -1;
     state->anneausockd = -1;
     state->last_token_time = time(NULL);
+}
+
+static void recompute_topology_ports(struct driver_state *state) {
+    if (state->nb_nodes == 0) {
+        return;
+    }
+
+    for (uint32_t i = 0; i < state->nb_nodes; i++) {
+        uint32_t next = (i + 1) % state->nb_nodes;
+        if (state->nb_nodes == 1) {
+            state->topology[i].output_port = state->topology[i].input_port;
+        } else {
+            state->topology[i].output_port = state->topology[next].input_port;
+        }
+    }
+}
+
+static void remove_peer_at(struct driver_state *state, uint32_t index) {
+    if (index >= state->nb_nodes) {
+        return;
+    }
+
+    for (uint32_t i = index; i + 1 < state->nb_nodes; i++) {
+        state->topology[i] = state->topology[i + 1];
+    }
+
+    if (state->nb_nodes > 0) {
+        state->nb_nodes -= 1;
+    }
+    recompute_topology_ports(state);
 }
 
 /* 
@@ -216,6 +252,28 @@ static void topology_handler(struct driver_state *state) {
     }
 }
 
+static void broadcast_topology(struct driver_state *state) {
+    struct anneau_topology_response rsp;
+    uint32_t payload_len;
+    uint8_t *payload;
+
+    if (state->nb_nodes <= 1 || state->anneausockd == -1) {
+        return;
+    }
+
+    rsp.count = state->nb_nodes;
+    payload_len = sizeof(rsp) + state->nb_nodes * sizeof(struct anneau_peer_info);
+    payload = malloc(payload_len);
+    if (payload == NULL) {
+        return;
+    }
+
+    memcpy(payload, &rsp, sizeof(rsp));
+    memcpy(payload + sizeof(rsp), state->topology, state->nb_nodes * sizeof(struct anneau_peer_info));
+    anneau_send_frame(state->anneausockd, ANNEAU_MSG_TOPOLOGY_RSP, 0, payload, payload_len);
+    free(payload);
+}
+
 /*
  * Traitement de la commande '/join' reçue depuis Comm.
  * C'est le point d'entrée pour la connexion de ce driver à l'anneau.
@@ -248,6 +306,7 @@ static void handle_join_request(struct driver_state *state, const struct anneau_
     anneau_copy_field(state->topology[0].node_id, sizeof(state->topology[0].node_id), state->node_id);
     anneau_copy_field(state->topology[0].host, sizeof(state->topology[0].host), state->listen_host);
     state->nb_nodes = 1;
+    recompute_topology_ports(state);
 
     // S'il n'y a pas d'hôte bootstrap, nous créons un nouvel anneau (flags = 1)
     if (req->flags == 1) { 
@@ -318,6 +377,7 @@ static void process_ring_frame(struct driver_state *state, struct anneau_frame *
             pair->input_port = req->listen_port;
             anneau_copy_field(pair->node_id, sizeof(pair->node_id), req->node_id);
             anneau_copy_field(pair->host, sizeof(pair->host), req->listen_host);
+            recompute_topology_ports(state);
             
             topology_handler(state);
             
@@ -333,6 +393,7 @@ static void process_ring_frame(struct driver_state *state, struct anneau_frame *
              */
             int my_idx = get_my_index(state);
             if (my_idx != -1 && my_idx == (int)state->nb_nodes - 2) {
+                state->ignore_next_left_disconnect = true;
                 reconnect_right(state);
             }
             
@@ -358,6 +419,10 @@ static void process_ring_frame(struct driver_state *state, struct anneau_frame *
                     anneau_send_frame(state->anneausockd, top_f.header.type, top_f.header.request_id, top_f.payload, top_f.header.payload_len);
                 }
                 free(payload);
+
+                if (state->has_token) {
+                    forward_token(state);
+                }
             }
         }
         return;
@@ -370,6 +435,7 @@ static void process_ring_frame(struct driver_state *state, struct anneau_frame *
             // Cas : Nous sommes le petit nouveau et nous recevons l'image globale du réseau
             state->nb_nodes = rsp->count;
             memcpy(state->topology, f->payload + sizeof(*rsp), rsp->count * sizeof(struct anneau_peer_info));
+            recompute_topology_ports(state);
             printf("[driver] Topologie synchronisée, %u noeuds présents.\n", state->nb_nodes);
             topology_handler(state);
             
@@ -377,9 +443,10 @@ static void process_ring_frame(struct driver_state *state, struct anneau_frame *
             reconnect_right(state);
         } else {
              // Cas : Mise à jour en cascade
-             if (rsp->count > state->nb_nodes) {
+             if (rsp->count != state->nb_nodes) {
                  state->nb_nodes = rsp->count;
                  memcpy(state->topology, f->payload + sizeof(*rsp), rsp->count * sizeof(struct anneau_peer_info));
+                 recompute_topology_ports(state);
                  topology_handler(state);
                  send_to_ring(state, f);
              }
@@ -406,12 +473,30 @@ static void process_ring_frame(struct driver_state *state, struct anneau_frame *
             send_to_ring(state, f); // Transmet toujours au suivant !
         }
     } else if (f->header.type == ANNEAU_MSG_FILE_START_EVT) {
-       const struct anneau_file_start *req = (const struct anneau_file_start *)f->payload;
-       if (strcmp(req->peer_id, state->node_id) == 0) {
-           send_to_comm(state, f->header.type, f->payload, f->header.payload_len);
-       } else {
-           send_to_ring(state, f);
-       }
+        const struct anneau_file_start *req = (const struct anneau_file_start *)f->payload;
+        if (strcmp(req->peer_id, state->node_id) == 0) {
+            state->file_receive_active = true;
+            state->file_receive_id = req->transfer_id;
+            send_to_comm(state, f->header.type, f->payload, f->header.payload_len);
+        } else {
+            send_to_ring(state, f);
+        }
+    } else if (f->header.type == ANNEAU_MSG_FILE_CHUNK_EVT) {
+        const struct anneau_file_chunk *chunk = (const struct anneau_file_chunk *)f->payload;
+        if (state->file_receive_active && chunk->transfer_id == state->file_receive_id) {
+            send_to_comm(state, f->header.type, f->payload, f->header.payload_len);
+        } else {
+            send_to_ring(state, f);
+        }
+    } else if (f->header.type == ANNEAU_MSG_FILE_END_EVT) {
+        const struct anneau_file_end *end = (const struct anneau_file_end *)f->payload;
+        if (state->file_receive_active && end->transfer_id == state->file_receive_id) {
+            send_to_comm(state, f->header.type, f->payload, f->header.payload_len);
+            state->file_receive_active = false;
+            state->file_receive_id = 0;
+        } else {
+            send_to_ring(state, f);
+        }
     } else {
         // Trame inconnue ou morceaux de fichiers : on transfère bêtement
         send_to_ring(state, f);
@@ -516,7 +601,7 @@ int main(int argc, char **argv) {
                     printf("[driver] Comm demande de quitter. Arrêt gracieux.\n");
                     close(state.localsock_client);
                     state.localsock_client = -1;
-                    exit(0); 
+                    state.should_exit = true;
                 } 
                 else if (f.header.type == ANNEAU_MSG_TOPOLOGY_REQ) {
                     topology_handler(&state);
@@ -562,6 +647,7 @@ int main(int argc, char **argv) {
                         if (f.header.type == ANNEAU_MSG_FILE_START_REQ) frame_evt.header.type = ANNEAU_MSG_FILE_START_EVT;
                         if (f.header.type == ANNEAU_MSG_FILE_CHUNK_REQ) frame_evt.header.type = ANNEAU_MSG_FILE_CHUNK_EVT;
                         if (f.header.type == ANNEAU_MSG_FILE_END_REQ)   frame_evt.header.type = ANNEAU_MSG_FILE_END_EVT;
+                        frame_evt.payload = f.payload;
                         enqueue(&state, &frame_evt);
                         send_queued_messages_if_token(&state);
                     }
@@ -571,7 +657,7 @@ int main(int argc, char **argv) {
                 printf("[driver] IHM Comm déconnectée brutalement.\n");
                 close(state.localsock_client);
                 state.localsock_client = -1;
-                exit(0);
+                state.should_exit = true;
             }
         }
 
@@ -598,12 +684,38 @@ int main(int argc, char **argv) {
                 printf("[driver] La machine voisine (Gauche) s'est déconnectée.\n");
                 close(state.anneausockg);
                 state.anneausockg = -1;
-                // AMELIORATION: On devrait immédiatement chercher à se rattacher, 
-                // ou marquer le nœud disparu dans le tableau de topologie.
+
+                if (state.ignore_next_left_disconnect) {
+                    state.ignore_next_left_disconnect = false;
+                } else if (state.nb_nodes > 1) {
+                    int my_idx = get_my_index(&state);
+                    if (my_idx != -1) {
+                        uint32_t left_idx = (uint32_t)((my_idx + (int)state.nb_nodes - 1) % (int)state.nb_nodes);
+                        printf("[driver] Retrait du voisin gauche %s de la topologie.\n",
+                               state.topology[left_idx].node_id);
+                        remove_peer_at(&state, left_idx);
+                        topology_handler(&state);
+                        if (state.nb_nodes > 1) {
+                            reconnect_right(&state);
+                            if (state.is_creator) {
+                                broadcast_topology(&state);
+                            }
+                        }
+                    }
+                }
             }
+        }
+
+        if (state.should_exit) {
+            break;
         }
     }
 
+    if (state.localsock_client != -1) close(state.localsock_client);
+    if (state.localsock_server != -1) close(state.localsock_server);
+    if (state.anneausockg != -1) close(state.anneausockg);
+    if (state.anneausockd != -1) close(state.anneausockd);
+    if (state.tcpsock_server != -1) close(state.tcpsock_server);
     unlink(chemin_sock);
     return 0;
 }
