@@ -4,6 +4,7 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <stdbool.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -274,6 +275,28 @@ static void broadcast_topology(struct driver_state *state) {
     free(payload);
 }
 
+static void send_topology_to_fd(struct driver_state *state, int fd) {
+    struct anneau_topology_response rsp;
+    uint32_t payload_len;
+    uint8_t *payload;
+
+    if (fd == -1) {
+        return;
+    }
+
+    rsp.count = state->nb_nodes;
+    payload_len = sizeof(rsp) + state->nb_nodes * sizeof(struct anneau_peer_info);
+    payload = malloc(payload_len);
+    if (payload == NULL) {
+        return;
+    }
+
+    memcpy(payload, &rsp, sizeof(rsp));
+    memcpy(payload + sizeof(rsp), state->topology, state->nb_nodes * sizeof(struct anneau_peer_info));
+    anneau_send_frame(fd, ANNEAU_MSG_TOPOLOGY_RSP, 0, payload, payload_len);
+    free(payload);
+}
+
 /*
  * Traitement de la commande '/join' reçue depuis Comm.
  * C'est le point d'entrée pour la connexion de ce driver à l'anneau.
@@ -395,6 +418,10 @@ static void process_ring_frame(struct driver_state *state, struct anneau_frame *
             if (my_idx != -1 && my_idx == (int)state->nb_nodes - 2) {
                 state->ignore_next_left_disconnect = true;
                 reconnect_right(state);
+                send_topology_to_fd(state, state->anneausockd);
+            }
+            if (my_idx == 0) {
+                state->ignore_next_left_disconnect = true;
             }
             
             /*
@@ -403,23 +430,6 @@ static void process_ring_frame(struct driver_state *state, struct anneau_frame *
              * qu'elle connaisse l'ensemble du réseau.
              */
             if (my_idx == 0) { 
-                struct anneau_topology_response rsp;
-                rsp.count = state->nb_nodes;
-                uint32_t payload_len = sizeof(rsp) + state->nb_nodes * sizeof(struct anneau_peer_info);
-                uint8_t *payload = malloc(payload_len);
-                memcpy(payload, &rsp, sizeof(rsp));
-                memcpy(payload + sizeof(rsp), state->topology, state->nb_nodes * sizeof(struct anneau_peer_info));
-                
-                struct anneau_frame top_f;
-                top_f.header.type = ANNEAU_MSG_TOPOLOGY_RSP;
-                top_f.header.payload_len = payload_len;
-                top_f.header.request_id = 0;
-                top_f.payload = payload;
-                if (state->anneausockd != -1) {
-                    anneau_send_frame(state->anneausockd, top_f.header.type, top_f.header.request_id, top_f.payload, top_f.header.payload_len);
-                }
-                free(payload);
-
                 if (state->has_token) {
                     forward_token(state);
                 }
@@ -448,6 +458,7 @@ static void process_ring_frame(struct driver_state *state, struct anneau_frame *
                  memcpy(state->topology, f->payload + sizeof(*rsp), rsp->count * sizeof(struct anneau_peer_info));
                  recompute_topology_ports(state);
                  topology_handler(state);
+                 reconnect_right(state);
                  send_to_ring(state, f);
              }
         }
@@ -508,6 +519,7 @@ int main(int argc, char **argv) {
     (void)argv;
     struct driver_state state;
     initialiser_etat(&state);
+    signal(SIGPIPE, SIG_IGN);
 
     // Initialisation et création du serveur socket Unix pour communiquer avec `Comm`
     const char *chemin_sock = ANNEAU_DEFAULT_SOCKET_PATH;

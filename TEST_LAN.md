@@ -1,29 +1,17 @@
-# Test LAN rapide
+# Tests LAN pour verifier le projet
 
-Ce document explique comment lancer et tester le projet sur plusieurs machines d'un meme reseau local.
+Objectif : verifier rapidement que le projet respecte les fonctions principales du PDF sur plusieurs machines du meme reseau.
 
-## Prerequis
+## 1. Preparation
 
 Sur chaque machine :
 
 ```sh
-make
+make clean && make
+rm -f /tmp/anneau_driver.sock
 ```
 
-Verifier aussi :
-
-- que les machines se pingent entre elles
-- que les ports choisis sont libres
-- qu'aucun pare-feu ne bloque les connexions TCP entre les machines
-
-## Programmes a lancer
-
-Sur chaque machine, il faut lancer :
-
-1. `driver`
-2. `comm`
-
-Exemple :
+Puis ouvrir deux terminaux par machine.
 
 Terminal 1 :
 
@@ -37,162 +25,196 @@ Terminal 2 :
 ./build/bin/comm
 ```
 
-## Commande de base
-
-Dans `comm` :
-
-```text
-join <id_noeud> <host_ecoute> <port_ecoute> [host_bootstrap port_bootstrap]
-```
-
-Regles :
-
-- sans `host_bootstrap port_bootstrap` : la machine cree l'anneau
-- avec `host_bootstrap port_bootstrap` : la machine rejoint un anneau existant
-
-## Test a 2 machines
-
-Exemple :
-
-- Machine A : `192.168.1.10`
-- Machine B : `192.168.1.11`
-
-### Machine A
-
-Lancer :
+Verifier les IP avec :
 
 ```sh
-./build/bin/driver
-./build/bin/comm
+hostname -I
 ```
 
-Puis dans `comm` :
+Exemple teste :
+
+- machine A : `nodeA`, IP `192.168.64.1`, port `9000`
+- machine B : `nodeB`, IP `192.168.64.7`, port `9100`
+- machine C : `nodeC`, IP `192.168.64.6`, port `9200`
+
+## 2. Creer l'anneau
+
+Dans `comm` sur la machine A :
 
 ```text
-join nodeA 192.168.1.10 9000
-peers
+join nodeA 192.168.64.1 9000
 ```
 
-### Machine B
-
-Lancer :
-
-```sh
-./build/bin/driver
-./build/bin/comm
-```
-
-Puis dans `comm` :
+Resultat attendu :
 
 ```text
-join nodeB 192.168.1.11 9100 192.168.1.10 9000
-peers
+nodeA 192.168.64.1 9000 9000 1
 ```
 
-### Verification attendue
+## 3. Ajouter une deuxieme machine
 
-Sur les deux machines, `peers` doit finir par afficher :
-
-- `nodeA`
-- `nodeB`
-
-## Test des messages
-
-Depuis la machine B :
+Dans `comm` sur la machine B :
 
 ```text
-send nodeA bonjour depuis B
-broadcast message pour tout le monde
+join nodeB 192.168.64.7 9100 192.168.64.1 9000
 ```
 
-Verification attendue sur la machine A :
-
-- reception du message unicast
-- reception de la diffusion
-
-## Test de fichier
-
-Depuis la machine B :
-
-```text
-sendfile nodeA ./README.md
-```
-
-Verification attendue sur la machine A :
-
-- creation d'un fichier dans `downloads/`
-
-## Test a 3 machines
-
-Exemple :
-
-- Machine A : `192.168.1.10`
-- Machine B : `192.168.1.11`
-- Machine C : `192.168.1.12`
-
-Ordre conseille :
-
-1. A cree l'anneau
-2. B rejoint A
-3. C rejoint A
-
-Commandes :
-
-### Machine A
-
-```text
-join nodeA 192.168.1.10 9000
-```
-
-### Machine B
-
-```text
-join nodeB 192.168.1.11 9100 192.168.1.10 9000
-```
-
-### Machine C
-
-```text
-join nodeC 192.168.1.12 9200 192.168.1.10 9000
-```
-
-Puis sur chaque machine :
+Puis sur A et B :
 
 ```text
 peers
 ```
 
-Verification attendue :
+Resultat attendu sur les deux machines :
 
-- les trois noeuds doivent apparaitre
+```text
+nodeA 192.168.64.1 9000 9100 1
+nodeB 192.168.64.7 9100 9000 1
+```
 
-## En cas de probleme
+## 4. Ajouter une troisieme machine
 
-Verifier dans cet ordre :
+Attendre que A et B affichent bien la meme topologie, puis dans `comm` sur la machine C :
 
-1. ping entre les machines
-2. bonne IP dans la commande `join`
-3. bon port d'ecoute du bootstrap
-4. `driver` bien lance avant `comm`
-5. aucun ancien socket local bloque :
+```text
+join nodeC 192.168.64.6 9200 192.168.64.1 9000
+```
+
+Puis sur A, B et C :
+
+```text
+peers
+```
+
+Resultat attendu sur les trois machines :
+
+```text
+nodeA 192.168.64.1 9000 9100 1
+nodeB 192.168.64.7 9100 9200 1
+nodeC 192.168.64.6 9200 9000 1
+```
+
+## 5. Tester les messages
+
+Depuis C vers A :
+
+```text
+send nodeA message-C-vers-A
+```
+
+A doit afficher :
+
+```text
+[message] nodeC -> nodeA : message-C-vers-A
+```
+
+Depuis A vers C :
+
+```text
+send nodeC message-A-vers-C
+```
+
+C doit afficher :
+
+```text
+[message] nodeA -> nodeC : message-A-vers-C
+```
+
+Depuis B :
+
+```text
+broadcast diffusion-B
+```
+
+A et C doivent afficher :
+
+```text
+[diffusion] nodeB : diffusion-B
+```
+
+## 6. Tester un fichier
+
+Sur A, creer un petit fichier :
 
 ```sh
+printf 'test fichier trois machines\n' > /tmp/test-anneau-3.txt
+```
+
+Dans `comm` sur A :
+
+```text
+sendfile nodeC /tmp/test-anneau-3.txt
+```
+
+Sur C, verifier :
+
+```sh
+cat downloads/nodeC_test-anneau-3.txt
+```
+
+Resultat attendu :
+
+```text
+test fichier trois machines
+```
+
+## 7. Tester un depart
+
+Dans `comm` sur C :
+
+```text
+leave
+```
+
+Puis sur A et B :
+
+```text
+peers
+```
+
+Resultat attendu :
+
+```text
+nodeA 192.168.64.1 9000 9100 1
+nodeB 192.168.64.7 9100 9000 1
+```
+
+Verifier que l'anneau restant fonctionne encore. Dans `comm` sur B :
+
+```text
+send nodeA apres-leave-C-ok
+```
+
+A doit afficher :
+
+```text
+[message] nodeB -> nodeA : apres-leave-C-ok
+```
+
+## 8. Nettoyage
+
+Sur chaque machine :
+
+```sh
+pkill -x driver || true
+pkill -x comm || true
 rm -f /tmp/anneau_driver.sock
 ```
 
-6. recompilation propre :
+## Verdict attendu
 
-```sh
-make clean && make
-```
+Si toutes les etapes passent, les fonctions principales du PDF sont validees sur LAN :
 
-## Limites connues
+- creation de l'anneau
+- ajout de machines
+- recuperation de la topologie avec port entrant et port sortant
+- envoi direct
+- diffusion
+- transfert de fichier
+- depart d'un noeud avec maintien de l'anneau restant
 
-Cette base est suffisante pour des tests simples, mais elle n'est pas encore validee comme implementation complete et robuste de tout le sujet.
+Limites a annoncer si on veut etre parfaitement honnete :
 
-En particulier, il faut rester prudent sur :
-
-- la fiabilite a plus de 2 noeuds
-- les departs dynamiques
-- la regeneration du jeton
-- les transferts de fichiers longs
+- tests faits jusqu'a 3 machines
+- transfert fichier valide sur petit fichier
+- pas de test de gros fichier ni de panne brutale type coupure reseau ou crash machine
