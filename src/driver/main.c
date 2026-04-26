@@ -115,7 +115,7 @@ static void send_status_to_comm(struct driver_state *state, int code, const char
  * Si nous sommes la seule machine du réseau, on l'ignore silencieusement.
  */
 static void send_to_ring(struct driver_state *state, const struct anneau_frame *f) {
-    if (state->nb_noeuds <= 1) { 
+    if (state->nb_nodes <= 1) { 
         return; // Anneau composé uniquement de nous-même
     }
     if (state->anneausockd != -1) {
@@ -123,10 +123,26 @@ static void send_to_ring(struct driver_state *state, const struct anneau_frame *
     }
 }
 
+static void send_queued_messages_if_token(struct driver_state *state) {
+    if (!state->has_token) {
+        return;
+    }
+
+    struct anneau_frame qf;
+    while (dequeue(state, &qf)) {
+        if (state->nb_nodes <= 1) {
+            send_to_comm(state, qf.header.type, qf.payload, qf.header.payload_len);
+        } else {
+            send_to_ring(state, &qf);
+        }
+        anneau_free_frame(&qf);
+    }
+}
+
 /* Fait circuler le jeton à la machine suivante (la droite) */
 static void forward_token(struct driver_state *state) {
     state->has_token = false;
-    if (state->nb_noeuds > 1 && state->anneausockd != -1) {
+    if (state->nb_nodes > 1 && state->anneausockd != -1) {
         anneau_send_frame(state->anneausockd, ANNEAU_MSG_RING_TOKEN, 0, NULL, 0);
     } else {
         // Si nous sommes seuls, on "garde" implicitement le jeton tout le temps
@@ -139,7 +155,7 @@ static void forward_token(struct driver_state *state) {
  * Retourne -1 si introuvable (ce qui serait une erreur).
  */
 static int get_my_index(struct driver_state *state) {
-    for (uint32_t i = 0; i < state->nb_noeuds; i++) {
+    for (uint32_t i = 0; i < state->nb_nodes; i++) {
         if (strcmp(state->topology[i].node_id, state->node_id) == 0) {
             return i;
         }
@@ -158,12 +174,12 @@ static void reconnect_right(struct driver_state *state) {
         state->anneausockd = -1;
     }
     int my_idx = get_my_index(state);
-    if (my_idx == -1 || state->nb_noeuds <= 1) {
+    if (my_idx == -1 || state->nb_nodes <= 1) {
         return; // Rien à faire, ou on est seuls
     }
     
     // Le suivant logique dans le tableau de l'anneau
-    int next_idx = (my_idx + 1) % state->nb_noeuds;
+    int next_idx = (my_idx + 1) % state->nb_nodes;
     struct anneau_peer_info *next = &state->topology[next_idx];
 
     printf("[driver] Reconnexion de anneausockd (droite) vers %s (%s:%d)\n", next->node_id, next->host, next->input_port);
@@ -190,11 +206,11 @@ static void reconnect_right(struct driver_state *state) {
 static void topology_handler(struct driver_state *state) {
     if (state->localsock_client != -1) {
         struct anneau_topology_response rsp;
-        rsp.count = state->nb_noeuds;
-        uint32_t payload_len = sizeof(rsp) + state->nb_noeuds * sizeof(struct anneau_peer_info);
+        rsp.count = state->nb_nodes;
+        uint32_t payload_len = sizeof(rsp) + state->nb_nodes * sizeof(struct anneau_peer_info);
         uint8_t *payload = malloc(payload_len);
         memcpy(payload, &rsp, sizeof(rsp));
-        memcpy(payload + sizeof(rsp), state->topology, state->nb_noeuds * sizeof(struct anneau_peer_info));
+        memcpy(payload + sizeof(rsp), state->topology, state->nb_nodes * sizeof(struct anneau_peer_info));
         send_to_comm(state, ANNEAU_MSG_TOPOLOGY_RSP, payload, payload_len);
         free(payload);
     }
@@ -231,7 +247,7 @@ static void handle_join_request(struct driver_state *state, const struct anneau_
     state->topology[0].input_port = state->listen_port;
     anneau_copy_field(state->topology[0].node_id, sizeof(state->topology[0].node_id), state->node_id);
     anneau_copy_field(state->topology[0].host, sizeof(state->topology[0].host), state->listen_host);
-    state->nb_noeuds = 1;
+    state->nb_nodes = 1;
 
     // S'il n'y a pas d'hôte bootstrap, nous créons un nouvel anneau (flags = 1)
     if (req->flags == 1) { 
@@ -256,16 +272,8 @@ static void handle_join_request(struct driver_state *state, const struct anneau_
         if (connect(s, (struct sockaddr *)&baddr, sizeof(baddr)) == 0) {
             // On se connecte temporairement au bootstrap par la droite pour envoyer notre demande
             state->anneausockd = s; 
-            
-            struct anneau_frame out_f;
-            out_f.header.type = ANNEAU_MSG_JOIN_REQ;
-            out_f.header.request_id = 0;
-            out_f.header.payload_len = sizeof(*req);
-            out_f.payload = malloc(sizeof(*req));
-            memcpy(out_f.payload, req, sizeof(*req));
-            
-            send_to_ring(state, &out_f);
-            free(out_f.payload);
+
+            anneau_send_frame(state->anneausockd, ANNEAU_MSG_JOIN_REQ, 0, req, sizeof(*req));
             send_status_to_comm(state, 0, "Requete de join envoyee");
         } else {
             send_status_to_comm(state, 1, "Echec de connexion à l'hôte bootstrap");
@@ -284,11 +292,7 @@ static void process_ring_frame(struct driver_state *state, struct anneau_frame *
         state->last_token_time = time(NULL);
 
         // Puisque nous avons le droit d'émettre, on vide toute notre file d'attente
-        struct anneau_frame qf;
-        while (dequeue(state, &qf)) {
-            send_to_ring(state, &qf);
-            anneau_free_frame(&qf);
-        }
+        send_queued_messages_if_token(state);
         
         // Et on redonne le jeton au voisin suivant immédiatement
         forward_token(state);
@@ -301,15 +305,15 @@ static void process_ring_frame(struct driver_state *state, struct anneau_frame *
         
         // Vérifie si l'on connait déjà ce nœud pour éviter une boucle infinie
         bool found = false;
-        for (uint32_t i = 0; i < state->nb_noeuds; i++) {
-            if (strcmp(state->topologie[i].node_id, req->node_id) == 0) {
+        for (uint32_t i = 0; i < state->nb_nodes; i++) {
+            if (strcmp(state->topology[i].node_id, req->node_id) == 0) {
                 found = true; break;
             }
         }
         
-        if (!found && state->nb_noeuds < ANNEAU_MAX_TOPOLOGY_ENTRIES) {
+        if (!found && state->nb_nodes < ANNEAU_MAX_TOPOLOGY_ENTRIES) {
             // Ajout du noeud à la fin de notre topologie
-            struct anneau_peer_info *pair = &state->topologie[state->nb_noeuds++];
+            struct anneau_peer_info *pair = &state->topology[state->nb_nodes++];
             pair->state = 1;
             pair->input_port = req->listen_port;
             anneau_copy_field(pair->node_id, sizeof(pair->node_id), req->node_id);
@@ -328,7 +332,7 @@ static void process_ring_frame(struct driver_state *state, struct anneau_frame *
              * physiquement à elle en reconfigurant notre prise `anneausockd`.
              */
             int my_idx = get_my_index(state);
-            if (my_idx != -1 && my_idx == state->nb_noeuds - 2) {
+            if (my_idx != -1 && my_idx == (int)state->nb_nodes - 2) {
                 reconnect_right(state);
             }
             
@@ -339,11 +343,11 @@ static void process_ring_frame(struct driver_state *state, struct anneau_frame *
              */
             if (my_idx == 0) { 
                 struct anneau_topology_response rsp;
-                rsp.count = state->nb_noeuds;
-                uint32_t payload_len = sizeof(rsp) + state->nb_noeuds * sizeof(struct anneau_peer_info);
+                rsp.count = state->nb_nodes;
+                uint32_t payload_len = sizeof(rsp) + state->nb_nodes * sizeof(struct anneau_peer_info);
                 uint8_t *payload = malloc(payload_len);
                 memcpy(payload, &rsp, sizeof(rsp));
-                memcpy(payload + sizeof(rsp), state->topologie, state->nb_noeuds * sizeof(struct anneau_peer_info));
+                memcpy(payload + sizeof(rsp), state->topology, state->nb_nodes * sizeof(struct anneau_peer_info));
                 
                 struct anneau_frame top_f;
                 top_f.header.type = ANNEAU_MSG_TOPOLOGY_RSP;
@@ -362,20 +366,20 @@ static void process_ring_frame(struct driver_state *state, struct anneau_frame *
     // 3. SYNCHRONISATION DE LA TOPOLOGIE (Réponse du bootstrap)
     if (f->header.type == ANNEAU_MSG_TOPOLOGY_RSP) {
         const struct anneau_topology_response *rsp = (const struct anneau_topology_response*)f->payload;
-        if (state->nb_noeuds <= 1) {
+        if (state->nb_nodes <= 1) {
             // Cas : Nous sommes le petit nouveau et nous recevons l'image globale du réseau
-            state->nb_noeuds = rsp->count;
-            memcpy(state->topologie, f->payload + sizeof(*rsp), rsp->count * sizeof(struct anneau_peer_info));
-            printf("[driver] Topologie synchronisée, %d noeuds présents.\n", state->nb_noeuds);
+            state->nb_nodes = rsp->count;
+            memcpy(state->topology, f->payload + sizeof(*rsp), rsp->count * sizeof(struct anneau_peer_info));
+            printf("[driver] Topologie synchronisée, %u noeuds présents.\n", state->nb_nodes);
             topology_handler(state);
             
             // On connecte notre "droite" au Nœud 0 (Boucler l'anneau)
             reconnect_right(state);
         } else {
              // Cas : Mise à jour en cascade
-             if (rsp->count > state->nb_noeuds) {
-                 state->nb_noeuds = rsp->count;
-                 memcpy(state->topologie, f->payload + sizeof(*rsp), rsp->count * sizeof(struct anneau_peer_info));
+             if (rsp->count > state->nb_nodes) {
+                 state->nb_nodes = rsp->count;
+                 memcpy(state->topology, f->payload + sizeof(*rsp), rsp->count * sizeof(struct anneau_peer_info));
                  topology_handler(state);
                  send_to_ring(state, f);
              }
@@ -387,23 +391,23 @@ static void process_ring_frame(struct driver_state *state, struct anneau_frame *
     bool for_me = false;
     if (f->header.type == ANNEAU_MSG_TEXT_EVT) {
         const struct anneau_text_event *evt = (const struct anneau_text_event*)f->payload;
-        if (strcmp(evt->destination, state->id_noeud) == 0) {
+        if (strcmp(evt->destination, state->node_id) == 0) {
             for_me = true;
             send_to_comm(state, f->header.type, f->payload, f->header.payload_len);
         }
         // Si je ne suis pas l'émetteur d'origine, je fais circuler la trame
-        if (strcmp(evt->source, state->id_noeud) != 0) {
+        if (strcmp(evt->source, state->node_id) != 0) {
             if (!for_me) send_to_ring(state, f);
         }
     } else if (f->header.type == ANNEAU_MSG_BROADCAST_EVT) {
         const struct anneau_broadcast_event *evt = (const struct anneau_broadcast_event*)f->payload;
-        if (strcmp(evt->source, state->id_noeud) != 0) {
+        if (strcmp(evt->source, state->node_id) != 0) {
             send_to_comm(state, f->header.type, f->payload, f->header.payload_len);
             send_to_ring(state, f); // Transmet toujours au suivant !
         }
     } else if (f->header.type == ANNEAU_MSG_FILE_START_EVT) {
        const struct anneau_file_start *req = (const struct anneau_file_start *)f->payload;
-       if (strcmp(req->peer_id, state->id_noeud) == 0) {
+       if (strcmp(req->peer_id, state->node_id) == 0) {
            send_to_comm(state, f->header.type, f->payload, f->header.payload_len);
        } else {
            send_to_ring(state, f);
@@ -418,7 +422,7 @@ int main(int argc, char **argv) {
     (void)argc;
     (void)argv;
     struct driver_state state;
-    init_state(&state);
+    initialiser_etat(&state);
 
     // Initialisation et création du serveur socket Unix pour communiquer avec `Comm`
     const char *chemin_sock = ANNEAU_DEFAULT_SOCKET_PATH;
@@ -476,14 +480,14 @@ int main(int argc, char **argv) {
         }
 
         // Vérification de la perte du jeton
-        if (state.is_creator && state.nb_noeuds > 1) {
+        if (state.is_creator && state.nb_nodes > 1) {
             if (!state.has_token && (time(NULL) - state.last_token_time) > TOKEN_TIMEOUT_SEC) {
                 printf("[driver] ATTENTION: Jeton perdu ! Régénération du jeton.\n");
                 state.has_token = true;
                 state.last_token_time = time(NULL);
                 forward_token(&state);
             }
-        } else if (state.has_token && state.nb_noeuds > 1) {
+        } else if (state.has_token && state.nb_nodes > 1) {
             // Si on détient le jeton virtuellement mais qu'il n'y a pas d'activité, on le passe au suivant
             forward_token(&state);
         }
@@ -506,7 +510,7 @@ int main(int argc, char **argv) {
             if (anneau_recv_frame(state.localsock_client, &f) > 0) {
                 
                 if (f.header.type == ANNEAU_MSG_JOIN_REQ) {
-                    gerer_requete_join_de_comm(&state, &f);
+                    handle_join_request(&state, &f);
                 } 
                 else if (f.header.type == ANNEAU_MSG_LEAVE_REQ) {
                     printf("[driver] Comm demande de quitter. Arrêt gracieux.\n");
@@ -515,7 +519,7 @@ int main(int argc, char **argv) {
                     exit(0); 
                 } 
                 else if (f.header.type == ANNEAU_MSG_TOPOLOGY_REQ) {
-                    synchroniser_topologie_vers_comm(&state);
+                    topology_handler(&state);
                 } 
                 else if (f.header.type >= 10 && f.header.type < 20) {
                     /*
@@ -529,25 +533,27 @@ int main(int argc, char **argv) {
                         frame_evt.header.type = ANNEAU_MSG_TEXT_EVT;
                         const struct anneau_text_request *req = (const struct anneau_text_request *)f.payload;
                         struct anneau_text_event *evt = malloc(sizeof(*evt) + req->text_len);
-                        anneau_copy_field(evt->source, sizeof(evt->source), state.id_noeud);
+                        anneau_copy_field(evt->source, sizeof(evt->source), state.node_id);
                         anneau_copy_field(evt->destination, sizeof(evt->destination), req->destination);
                         evt->text_len = req->text_len;
                         memcpy((uint8_t*)evt + sizeof(*evt), f.payload + sizeof(*req), req->text_len);
                         frame_evt.header.payload_len = sizeof(*evt) + req->text_len;
                         frame_evt.payload = (uint8_t*)evt;
-                        enfiler_message(&state, &frame_evt);
+                        enqueue(&state, &frame_evt);
+                        send_queued_messages_if_token(&state);
                         free(evt);
                     } 
                     else if (f.header.type == ANNEAU_MSG_BROADCAST_REQ) {
                         frame_evt.header.type = ANNEAU_MSG_BROADCAST_EVT;
                         const struct anneau_broadcast_request *req = (const struct anneau_broadcast_request *)f.payload;
                         struct anneau_broadcast_event *evt = malloc(sizeof(*evt) + req->text_len);
-                        anneau_copy_field(evt->source, sizeof(evt->source), state.id_noeud);
+                        anneau_copy_field(evt->source, sizeof(evt->source), state.node_id);
                         evt->text_len = req->text_len;
                         memcpy((uint8_t*)evt + sizeof(*evt), f.payload + sizeof(*req), req->text_len);
                         frame_evt.header.payload_len = sizeof(*evt) + req->text_len;
                         frame_evt.payload = (uint8_t*)evt;
-                        enfiler_message(&state, &frame_evt);
+                        enqueue(&state, &frame_evt);
+                        send_queued_messages_if_token(&state);
                         free(evt);
                     } 
                     else {
@@ -556,7 +562,8 @@ int main(int argc, char **argv) {
                         if (f.header.type == ANNEAU_MSG_FILE_START_REQ) frame_evt.header.type = ANNEAU_MSG_FILE_START_EVT;
                         if (f.header.type == ANNEAU_MSG_FILE_CHUNK_REQ) frame_evt.header.type = ANNEAU_MSG_FILE_CHUNK_EVT;
                         if (f.header.type == ANNEAU_MSG_FILE_END_REQ)   frame_evt.header.type = ANNEAU_MSG_FILE_END_EVT;
-                        enfiler_message(&state, &frame_evt);
+                        enqueue(&state, &frame_evt);
+                        send_queued_messages_if_token(&state);
                     }
                 }
                 anneau_free_frame(&f);
